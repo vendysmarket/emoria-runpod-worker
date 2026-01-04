@@ -1,7 +1,8 @@
 runpod==1.7.7
-torch==2.4.1
-transformers==4.44.2
-peft==0.12.0
-accelerate==0.34.2
-safetensors==0.4.5
-huggingface_hub==0.24.6
+transformers>=4.45.0
+accelerate>=0.33.0
+safetensors>=0.4.3
+peft>=0.12.0
+sentencepiece>=0.2.0
+protobuf>=4.25.3
+huggingface_hub>=0.24.0
