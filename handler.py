@@ -1,83 +1,125 @@
 import os
-import time
-import torch
 import runpod
+import torch
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-BASE_MODEL = os.getenv("BASE_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
-LORA_REPO  = os.getenv("LORA_REPO", "emoria/master_v1")
-HF_TOKEN   = os.getenv("HF_TOKEN", "").strip()
+BASE_PATH = "/models/base"
+LORA_PATH = "/models/lora"
 
-# Load at cold-start (Serverless worker boot)
-def _load():
-    tok_kwargs = {}
-    if HF_TOKEN:
-        tok_kwargs["token"] = HF_TOKEN
+# Offline hardening: runtime ne próbáljon netre menni
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True, **tok_kwargs)
+TOKENIZER = None
+MODEL = None
 
-    model_kwargs = {}
-    if HF_TOKEN:
-        model_kwargs["token"] = HF_TOKEN
 
-    model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        **model_kwargs,
+def _load_once():
+    global TOKENIZER, MODEL
+    if TOKENIZER is not None and MODEL is not None:
+        return
+
+    # Tokenizer + base model LOCAL-ból
+    TOKENIZER = AutoTokenizer.from_pretrained(
+        BASE_PATH,
+        use_fast=True,
+        local_files_only=True,
+        trust_remote_code=False,
     )
 
-    # Attach LoRA adapter
-    model = PeftModel.from_pretrained(model, LORA_REPO, **model_kwargs)
-    model.eval()
+    base = AutoModelForCausalLM.from_pretrained(
+        BASE_PATH,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        local_files_only=True,
+        trust_remote_code=False,
+    )
 
-    return tokenizer, model
+    # LoRA adapter LOCAL-ból
+    MODEL = PeftModel.from_pretrained(
+        base,
+        LORA_PATH,
+        local_files_only=True,
+        is_trainable=False,
+    )
+    MODEL.eval()
 
 
-TOKENIZER, MODEL = _load()
+def _build_prompt(user_text: str) -> str:
+    """
+    Mistral-Instruct kompatibilis chat prompt.
+    Ha van chat_template, használjuk; különben fallback.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return ""
 
-
-def _build_prompt(message: str) -> str:
-    # Mistral Instruct chat template
-    messages = [{"role": "user", "content": message}]
-    return TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    try:
+        messages = [{"role": "user", "content": user_text}]
+        return TOKENIZER.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    except Exception:
+        # Fallback (nem ideális, de működik)
+        return f"<s>[INST] {user_text} [/INST]"
 
 
 def handler(job):
     try:
-        inp = job.get("input", {}) or {}
-        msg = inp.get("message") or inp.get("prompt") or ""
-        msg = str(msg).strip()
-        if not msg:
-            return {"ok": False, "error": "missing_message"}
+        _load_once()
 
-        prompt = _build_prompt(msg)
+        inp = job.get("input") or {}
+        # RunPod UI példában: {"input":{"prompt":"Hello World"}}
+        # Te nálad néha: {"input":{"message":"..."}}
+        user_text = inp.get("prompt") or inp.get("message") or ""
 
-        inputs = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
+        prompt = _build_prompt(user_text)
+        if not prompt:
+            return {"ok": False, "error": "Empty prompt/message."}
+
+        max_new_tokens = int(inp.get("max_new_tokens", 140))
+        temperature = float(inp.get("temperature", 0.7))
+        top_p = float(inp.get("top_p", 0.9))
+        repetition_penalty = float(inp.get("repetition_penalty", 1.05))
+
+        inputs = TOKENIZER(prompt, return_tensors="pt")
+        inputs = {k: v.to(MODEL.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             out = MODEL.generate(
                 **inputs,
-                max_new_tokens=int(inp.get("max_new_tokens", 120)),
+                max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=float(inp.get("temperature", 0.7)),
-                top_p=float(inp.get("top_p", 0.9)),
-                repetition_penalty=float(inp.get("repetition_penalty", 1.05)),
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
                 eos_token_id=TOKENIZER.eos_token_id,
             )
 
         text = TOKENIZER.decode(out[0], skip_special_tokens=True)
 
-        # Strip the prompt part if needed
-        # (simple heuristic: return last assistant-like segment)
-        if msg in text:
-            text = text.split(msg, 1)[-1].strip()
+        # Ha benne maradt a prompt eleje, vágjuk le egyszerűen
+        # (az apply_chat_template-nél általában nem kell, de safe)
+        if user_text and user_text in text:
+            # a user_text utáni részt próbáljuk visszaadni
+            idx = text.rfind(user_text)
+            tail = text[idx + len(user_text):].strip()
+            if tail:
+                text = tail
 
-        return {"ok": True, "text": text}
+        return {"ok": True, "text": text.strip()}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-runpod.serverless.start({"handler": handler})
+# Local dev: python handler.py (opcionális)
+if __name__ == "__main__":
+    # runpod serverless mode
+    runpod.serverless.start({"handler": handler})
